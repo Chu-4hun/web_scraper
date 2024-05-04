@@ -1,0 +1,21 @@
+[package]
+name = "jobs-scraper"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+anyhow = "1.0"
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing = "0.1"
+scraper = "0.19.0"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "hickory-dns",
+] }
+lazy_static = "1.4.0"
+regex = "1.10.4"

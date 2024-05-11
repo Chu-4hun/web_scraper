@@ -1,7 +1,7 @@
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug,Clone)]
 #[command(version, about, long_about = None)]
 pub struct Opts {
     /// Log level of application

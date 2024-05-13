@@ -3,11 +3,11 @@ pub mod macros;
 pub mod models;
 pub mod opts;
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::bail;
 use clap::Parser;
-use futures::{stream::TryStreamExt, StreamExt};
+use futures::{stream::TryStreamExt, Future, StreamExt};
 use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
@@ -35,6 +35,7 @@ static ref PROJ_NAME_REGEX: Regex = Regex::new(
     static ref JOB_NO_EXP_SELECTOR: Selector =
         Selector::parse(r#"a[href="/vakansii/chehiya/filter-bez-oputa"]"#).unwrap();
     static ref JOB_IS_HOT_SELECTOR: Selector = Selector::parse("div.hot-btn").unwrap();
+    static ref JOB_IS_HOT_BADGE_SELECTOR: Selector = Selector::parse("div.hot-badge").unwrap();
 
     }
 
@@ -50,30 +51,40 @@ async fn main() -> anyhow::Result<()> {
     registry().with(filter).with(layer()).init();
 
     let client = Arc::new(reqwest::ClientBuilder::new().build()?);
-    let (total_count, init_urls) =
-        parse_page(&client, "https://layboard.com/vakansii/chehiya", true).await?;
+
+    let (resp, document) = get_page_html(&client, "https://layboard.com/vakansii/chehiya").await?;
+    let total_count = get_total_count(resp);
+    let ignore_urls: HashSet<String> = HashSet::from_iter(
+        get_filter_urls(&document)
+            .into_iter()
+            .map(|f| format!("https://layboard.com{}", f)),
+    );
+    debug!("ignore_urls = {ignore_urls:?}");
+    let init_urls: Vec<String> = get_urls(document);
 
     let init_len = init_urls.len() as f64;
-    let res = process_urls(client.clone(), opts.clone(), init_urls).await;
-
+    let res = process_urls(client.clone(), opts.clone(), &init_urls, &ignore_urls).await;
     debug!("initial run total: {} page size {}", total_count, init_len);
     if res.is_err() {
         info!("parsing stopped {res:?}");
         return Ok(());
     }
-
     for page in 2..=((total_count as f64 / init_len).ceil() as usize) {
         debug!("parsing page: {page}");
-        let (_, urls) = parse_page(
+        let urls = parse_page(
             &client,
             &format!("https://layboard.com/vakansii/chehiya?page={}", page),
-            false,
         )
         .await?;
 
+        let urls = urls
+            .into_iter()
+            .filter(|f| !ignore_urls.contains(f))
+            .collect::<Vec<String>>();
+
         debug!("{urls:?}");
 
-        let res = process_urls(client.clone(), opts.clone(), urls).await;
+        let res = process_urls(client.clone(), opts.clone(), &urls, &ignore_urls).await;
 
         if res.is_err() {
             break;
@@ -83,57 +94,83 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn parse_page(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<String>> {
+    let document = Html::parse_document(&client.get(url).send().await?.text().await?);
+    let urls = get_urls(document);
+    Ok(urls)
+}
+
+fn get_urls(document: Html) -> Vec<String> {
+    let urls = document
+        .select(&JOB_SELECTOR)
+        .map(|i| i.value().attr("href").unwrap().to_string())
+        .collect::<Vec<String>>();
+    urls
+}
+
+fn get_filter_urls(document: &Html) -> Vec<String> {
+    document
+        .select(&JOB_SELECTOR)
+        .filter_map(|elem| {
+            if elem.select(&JOB_IS_HOT_BADGE_SELECTOR).next().is_some() {
+                Some(elem
+                    .value().attr("href").unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<String>>()
+}
+
+fn get_total_count(input_text: String) -> usize {
+    let caps = &PROJ_NAME_REGEX.captures(&input_text).unwrap()[0];
+    let count_fragment = Html::parse_fragment(caps);
+
+    count_fragment
+        .select(&COUNT_SELECTOR)
+        .next()
+        .map(|elem| elem.text().collect::<String>())
+        .unwrap_or(0.to_string())
+        .parse::<usize>()
+        .unwrap_or(0)
+}
+
+async fn get_page_html(client: &Client, url: &str) -> anyhow::Result<(String, Html)> {
+    let resp = client.get(url).send().await?.text().await?;
+    let document = Html::parse_document(&resp);
+    Ok((resp, document))
+}
 async fn process_urls(
     client: Arc<Client>,
     opts: Arc<Opts>,
-    urls: Vec<String>,
+    urls: &[String],
+    ignore_urls: &HashSet<String>,
 ) -> anyhow::Result<()> {
     futures::stream::iter(urls)
         .map(Ok)
-        .try_for_each_concurrent(1, |url| {
+        .try_for_each_concurrent(opts.threads, |url| {
             let client_ref = Arc::as_ref(&client);
             let opts = Arc::as_ref(&opts);
+
             async move {
-                parse_vacancy(client_ref, opts, &concat_str!("https://layboard.com", &url)).await
+                parse_vacancy(
+                    client_ref,
+                    opts,
+                    &concat_str!("https://layboard.com", &url),
+                    ignore_urls,
+                )
+                .await
             }
         })
         .await
 }
 
-async fn parse_page(
+async fn parse_vacancy(
     client: &reqwest::Client,
+    opts: &Opts,
     url: &str,
-    get_total: bool,
-) -> anyhow::Result<(usize, Vec<String>)> {
-    let resp = client.get(url).send().await?.text().await?;
-
-    let document = Html::parse_document(&resp);
-
-    let total_count =
-     if get_total {
-        let caps = &PROJ_NAME_REGEX.captures(&resp).unwrap()[0];
-        let count_fragment = Html::parse_fragment(caps);
-
-        count_fragment
-            .select(&COUNT_SELECTOR)
-            .next()
-            .map(|elem| elem.text().collect::<String>())
-            .unwrap_or(0.to_string())
-            .parse::<usize>()
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    let urls = document
-        .select(&JOB_SELECTOR)
-        .map(|i| i.value().attr("href").unwrap().to_string())
-        .collect::<Vec<String>>();
-
-    Ok((total_count, urls))
-}
-
-async fn parse_vacancy(client: &reqwest::Client, opts: &Opts, url: &str) -> anyhow::Result<()> {
+    ignore_urls: &HashSet<String>,
+) -> anyhow::Result<()> {
     debug!("parsing url: {url}");
     let resp = client.get(url).send().await?.text().await?;
 
@@ -191,8 +228,7 @@ async fn parse_vacancy(client: &reqwest::Client, opts: &Opts, url: &str) -> anyh
         .json(&vac)
         .send()
         .await?;
-
-    if is_hot {
+    if is_hot || ignore_urls.contains(url) {
         info!("hot vacancy found: {url}");
     } else if resp.status().is_client_error() {
         info!("parsing stopped \n{:#?}", resp.text().await?);

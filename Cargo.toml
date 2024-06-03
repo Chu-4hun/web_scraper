@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 
 anyhow = "1.0"
-tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing = "0.1"
 scraper = "0.19.0"
@@ -16,6 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
     "hickory-dns",
+    "stream","multipart"
 ] }
 lazy_static = "1.4.0"
 regex = "1.10.4"
@@ -23,3 +24,13 @@ clap = { version = "4.5.4", features = ["derive", "env"] }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.116"
 futures = "0.3.30"
+serde-jsonlines = "0.5.0"
+tokio-util = { version = "0.7.11", features = ["codec"] }
+
+
+
+[profile.final]
+inherits = "release"
+codegen-units = 1
+lto = true
+strip = true

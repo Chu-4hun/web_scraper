@@ -1,15 +1,17 @@
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Vacancy {
-    pub site: usize,
-    #[serde(rename = "URL")]
-    pub url: String,
+    pub type_id: i64,
     pub title: String,
-    pub description: Option<String>,
-    pub date: Option<String>,
-    pub salary: Option<String>,
-    pub visa: Option<bool>,
-    pub experience: Option<bool>,
-    pub language: Option<String>,
+    pub description: String,
+    pub view_url: String,
+    pub name: String,
+    pub author: Author,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Author {
+    pub name: String,
 }

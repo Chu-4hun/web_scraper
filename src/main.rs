@@ -3,20 +3,27 @@ pub mod macros;
 pub mod models;
 pub mod opts;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc, time::SystemTime, vec};
 
 use anyhow::bail;
 use clap::Parser;
-use futures::{stream::TryStreamExt, Future, StreamExt};
+use futures::stream::{self, StreamExt};
+use models::{Author, Vacancy};
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{header, multipart, Body, Client};
 use scraper::{Html, Selector};
+use tokio::fs::File;
+use tokio_util::codec::{BytesCodec, FramedRead};
 use tracing::{debug, info};
 use tracing_subscriber::{
-    fmt::layer, layer::SubscriberExt, registry, util::SubscriberInitExt, EnvFilter,
+    fmt::{format, layer},
+    layer::SubscriberExt,
+    registry,
+    util::SubscriberInitExt,
+    EnvFilter,
 };
 
-use crate::{consts::DEFAULT_LOG_FILTERS, models::Vacancy, opts::Opts};
+use crate::{consts::DEFAULT_LOG_FILTERS, opts::Opts};
 
 lazy_static::lazy_static! {
 static ref PROJ_NAME_REGEX: Regex = Regex::new(
@@ -37,7 +44,7 @@ static ref PROJ_NAME_REGEX: Regex = Regex::new(
     static ref JOB_IS_HOT_SELECTOR: Selector = Selector::parse("div.hot-btn").unwrap();
     static ref JOB_IS_HOT_BADGE_SELECTOR: Selector = Selector::parse("div.hot-badge").unwrap();
 
-    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,7 +57,16 @@ async fn main() -> anyhow::Result<()> {
     }
     registry().with(filter).with(layer()).init();
 
-    let client = Arc::new(reqwest::ClientBuilder::new().build()?);
+    let mut headers = header::HeaderMap::new();
+    let mut auth_value = header::HeaderValue::from_str(&opts.key)?;
+    auth_value.set_sensitive(true);
+    headers.insert("Api-Key", auth_value);
+
+    let client = Arc::new(
+        reqwest::ClientBuilder::new()
+            .default_headers(headers)
+            .build()?,
+    );
 
     let (resp, document) = get_page_html(&client, "https://layboard.com/vakansii/chehiya").await?;
     let total_count = get_total_count(resp);
@@ -63,34 +79,68 @@ async fn main() -> anyhow::Result<()> {
     let init_urls: Vec<String> = get_urls(document);
 
     let init_len = init_urls.len() as f64;
-    let res = process_urls(client.clone(), opts.clone(), &init_urls, &ignore_urls).await;
-    debug!("initial run total: {} page size {}", total_count, init_len);
-    if res.is_err() {
-        info!("parsing stopped {res:?}");
-        return Ok(());
+    let mut vacancies = vec![];
+    for url in init_urls {
+        vacancies.push(
+            parse_vacancy(
+                Arc::as_ref(&client),
+                Arc::as_ref(&opts),
+                &concat_str!("https://layboard.com", &url),
+                &ignore_urls,
+            )
+            .await?,
+        );
     }
+  
     for page in 2..=((total_count as f64 / init_len).ceil() as usize) {
-        debug!("parsing page: {page}");
+        info!("parsing page: {page}");
         let urls = parse_page(
             &client,
             &format!("https://layboard.com/vakansii/chehiya?page={}", page),
         )
         .await?;
-
-        let urls = urls
-            .into_iter()
-            .filter(|f| !ignore_urls.contains(f))
-            .collect::<Vec<String>>();
-
-        debug!("{urls:?}");
-
-        let res = process_urls(client.clone(), opts.clone(), &urls, &ignore_urls).await;
-
-        if res.is_err() {
-            break;
+        for url in urls {
+            vacancies.push(
+                parse_vacancy(
+                    Arc::as_ref(&client),
+                    Arc::as_ref(&opts),
+                    &concat_str!("https://layboard.com", &url),
+                    &ignore_urls,
+                )
+                .await?,
+            );
         }
+        debug!("vac {:#?}", vacancies);
     }
+    send_file(&vacancies, &client, &opts).await?;
 
+    Ok(())
+}
+
+async fn send_file(vacancies: &Vec<Vacancy>, client: &Client, opts: &Opts) -> anyhow::Result<()> {
+    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+    let filename = format!("layboard.com-{}.jsonl", time.as_secs());
+    serde_jsonlines::write_json_lines(filename.clone(), vacancies)?;
+
+    let file = File::open(filename.as_str()).await?;
+    // read file body stream
+    let stream = FramedRead::new(file, BytesCodec::new());
+    let file_body = Body::wrap_stream(stream);
+
+    //make form part of file
+    let some_file = multipart::Part::stream(file_body)
+        .file_name(filename)
+        .mime_str("text/plain")?;
+
+    let form = multipart::Form::new().part("file", some_file);
+    // https://base.eriar.com/api/ads/import
+    let url = opts.url.clone();
+    let response = client
+        .post(concat_str!(url, "/api/ads/import".to_string()))
+        .multipart(form)
+        .send()
+        .await?;
+    debug!("export res: \n{} ", response.text().await?);
     Ok(())
 }
 
@@ -113,8 +163,7 @@ fn get_filter_urls(document: &Html) -> Vec<String> {
         .select(&JOB_SELECTOR)
         .filter_map(|elem| {
             if elem.select(&JOB_IS_HOT_BADGE_SELECTOR).next().is_some() {
-                Some(elem
-                    .value().attr("href").unwrap().to_string())
+                Some(elem.value().attr("href").unwrap().to_string())
             } else {
                 None
             }
@@ -140,99 +189,55 @@ async fn get_page_html(client: &Client, url: &str) -> anyhow::Result<(String, Ht
     let document = Html::parse_document(&resp);
     Ok((resp, document))
 }
-async fn process_urls(
-    client: Arc<Client>,
-    opts: Arc<Opts>,
-    urls: &[String],
-    ignore_urls: &HashSet<String>,
-) -> anyhow::Result<()> {
-    futures::stream::iter(urls)
-        .map(Ok)
-        .try_for_each_concurrent(opts.threads, |url| {
-            let client_ref = Arc::as_ref(&client);
-            let opts = Arc::as_ref(&opts);
-
-            async move {
-                parse_vacancy(
-                    client_ref,
-                    opts,
-                    &concat_str!("https://layboard.com", &url),
-                    ignore_urls,
-                )
-                .await
-            }
-        })
-        .await
-}
 
 async fn parse_vacancy(
     client: &reqwest::Client,
     opts: &Opts,
     url: &str,
     ignore_urls: &HashSet<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vacancy> {
     debug!("parsing url: {url}");
     let resp = client.get(url).send().await?.text().await?;
 
     let document = Html::parse_document(&resp);
 
-    let mut description = "".to_string();
-    // debug!("{:#?}", document
-    //     .select(&JOB_TITLE_SELECTOR).collect::<Vec<_>>());
-    let title = document
-        .select(&JOB_TITLE_SELECTOR)
-        .next()
-        .unwrap()
-        .text()
-        .collect::<String>();
+    let mut description = " ".to_string();
+    let mut title = " ".to_string();
+    if let Some(_title) = document.select(&JOB_TITLE_SELECTOR).next() {
+        title = _title.text().collect::<String>();
+    }
 
     document
         .select(&JOB_DESCRIPTION_SELECTOR)
         .for_each(|i| description.push_str(i.text().collect::<String>().trim()));
 
-    let salary = document
-        .select(&JOB_SALARY_SELECTOR)
-        .next()
-        .unwrap()
-        .text()
-        .collect::<String>();
+    // let salary = document
+    //     .select(&JOB_SALARY_SELECTOR)
+    //     .next()
+    //     .unwrap()
+    //     .text()
+    //     .collect::<String>();
 
-    let is_visa = document.select(&JOB_VISA_SELECTOR).next().is_some();
-    let is_exp = document.select(&JOB_EXP_SELECTOR).next().is_some();
-    let is_no_exp = document.select(&JOB_NO_EXP_SELECTOR).next().is_some();
     let is_hot = document.select(&JOB_IS_HOT_SELECTOR).next().is_some();
 
-    let is_exp_needed = {
-        if is_exp {
-            Some(true)
-        } else if is_no_exp {
-            Some(false)
-        } else {
-            None
-        }
-    };
-
     let vac = Vacancy {
-        site: opts.site_id,
-        url: url.to_string(),
+        type_id: 1,
+        view_url: url.to_string(),
         title,
-        description: Some(description),
-        date: None,
-        salary: Some(salary),
-        visa: Some(is_visa),
-        experience: is_exp_needed,
-        language: None,
+        description,
+        name: String::from_str("layboard.com")?,
+        author:Author{name: "layboard.com".to_string()}
     };
-    let resp = client
-        .post(&concat_str!(opts.url.clone(), "/vacancies".to_string()))
-        .json(&vac)
-        .send()
-        .await?;
+    // let resp = client
+    //     .post(&concat_str!(opts.url.clone(), "/vacancies".to_string()))
+    //     .json(&vac)
+    //     .send()
+    //     .await?;
     if is_hot || ignore_urls.contains(url) {
         info!("hot vacancy found: {url}");
-    } else if resp.status().is_client_error() {
-        info!("parsing stopped \n{:#?}", resp.text().await?);
-        bail!("parsing stopped");
     }
-    Ok(())
+    // else {
+    //     bail!("parsing stopped");
+    // }
+    Ok(vac)
 }

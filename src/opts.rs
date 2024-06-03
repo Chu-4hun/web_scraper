@@ -10,8 +10,9 @@ pub struct Opts {
 
     #[arg(global = true, short, long, env, default_value_t = 1)]
    pub site_id: usize,
-    #[arg(global = true, short, long, env, default_value_t = 1)]
-   pub threads: usize,
+
+    #[arg(short, long, env)]
+   pub key: String,
 
     #[arg(global = true, short, long, env, default_value_t = String::from("http://localhost:8081"))]
    pub url: String,
